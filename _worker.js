@@ -1,10 +1,19 @@
 // 定义外部变量
-let sitename = "域名监控"; //变量名SITENAME，自定义站点名称，默认为“域名监控”
-let domains = ""; //变量名DOMAINS，填入域名信息json文件直链，必须设置的变量
-let tgid = ""; //变量名TGID，填入TG机器人ID，不需要提醒则不填
-let tgtoken = ""; //变量名TGTOKEN，填入TG的TOKEN，不需要提醒则不填
-let days = 7; //变量名DAYS，提前几天发送TG提醒，默认为7天，必须为大于0的整数
+let sitename = "域名监控"; // 变量名SITENAME，自定义站点名称，默认为“域名监控”
+let domains = ""; // 变量名DOMAINS，填入域名信息json文件直链，必须设置的变量
+let tgid = ""; // 变量名TGID，填入TG机器人ID，不需要提醒则不填
+let tgtoken = ""; // 变量名TGTOKEN，填入TG的TOKEN，不需要提醒则不填
+let days = 7; // 变量名DAYS，提前几天发送TG提醒，默认为7天，必须为大于0的整数
+let VX_BOT_KEY = "";
+let PUSH_INTERVAL = 5; // 变量名PUSH_INTERVAL，推送间隔时间（分钟），默认为5分钟
 
+/**
+ * 发送Telegram消息
+ * @param {string} message - 要发送的消息内容
+ * @param {string} tgid - Telegram聊天ID
+ * @param {string} tgtoken - Telegram机器人Token
+ * @returns {Promise<void>} 无返回值
+ */
 async function sendtgMessage(message, tgid, tgtoken) {
   if (!tgid || !tgtoken) return;
   const url = `https://api.telegram.org/bot${tgtoken}/sendMessage`;
@@ -23,36 +32,103 @@ async function sendtgMessage(message, tgid, tgtoken) {
   }
 }
 
+/**
+ * 发送企业微信消息
+ * @param {string} message - 要发送的消息内容
+ * @param {string} VX_BOT_KEY - 企业微信机器人Key
+ * @returns {Promise<void>} 无返回值
+ */
+async function sendWXWorkMessage(message, VX_BOT_KEY) {
+  const webhookUrl = `https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=${VX_BOT_KEY}`;
+  const payload = {
+    msgtype: "text",
+    text: {
+      content: message,
+      mentioned_list: ["@all"] // 可选：需要@的用户或群组
+    }
+  };
+  try {
+    await fetch(webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  } catch (error) {
+    console.error("发送企业微信消息失败:", error.response?.data || error.message);
+  }
+}
+
+/**
+ * 定时推送所有域名的过期信息
+ * @param {import('worktop').Env} env - 环境变量对象
+ */
+async function schedulePushNotifications(env) {
+  const interval = Number(env.PUSH_INTERVAL || PUSH_INTERVAL) * 60 * 1000; // 转换为毫秒
+  setInterval(async () => {
+    try {
+      const domainsResponse = await fetch(env.DOMAINS);
+      if (!domainsResponse.ok) throw new Error('Network response was not ok');
+
+      const domainsData = await domainsResponse.json();
+      if (!Array.isArray(domainsData)) throw new Error('JSON 数据格式不正确');
+
+      const today = new Date().toISOString().split('T')[0]; // 当前日期字符串
+
+      for (const domain of domainsData) {
+        const expirationDate = new Date(domain.expirationDate);
+        const daysRemaining = Math.ceil((expirationDate - new Date()) / (1000 * 60 * 60 * 24));
+
+        const message = `[域名] ${domain.domain} 还有 ${daysRemaining} 天过期。过期日期：${domain.expirationDate}`;
+
+        await sendtgMessage(message, env.TGID, env.TGTOKEN); // 发送通知
+      }
+    } catch (error) {
+      console.error("定时推送失败:", error);
+    }
+  }, interval);
+}
+
 export default {
+  /**
+   * 处理HTTP请求的主函数
+   * @param {Request} request - 当前请求对象
+   * @param {import('worktop').Env} env - 环境变量对象
+   * @returns {Promise<Response>} 响应对象
+   */
   async fetch(request, env) {
     sitename = env.SITENAME || sitename;
     domains = env.DOMAINS || domains;
     tgid = env.TGID || tgid;
     tgtoken = env.TGTOKEN || tgtoken;
     days = Number(env.DAYS || days);
+    PUSH_INTERVAL = Number(env.PUSH_INTERVAL || PUSH_INTERVAL);
 
     if (!domains) {
       return new Response("DOMAINS 环境变量未设置", { status: 500 });
     }
 
+    // 启动定时推送任务
+    schedulePushNotifications(env);
+
     try {
       const response = await fetch(domains);
       if (!response.ok) throw new Error('Network response was not ok');
-      
+
       domains = await response.json();
       if (!Array.isArray(domains)) throw new Error('JSON 数据格式不正确');
-      
+
       const today = new Date().toISOString().split('T')[0]; // 当前日期字符串
 
+      // 遍历处理每个域名的过期提醒
       for (const domain of domains) {
         const expirationDate = new Date(domain.expirationDate);
         const daysRemaining = Math.ceil((expirationDate - new Date()) / (1000 * 60 * 60 * 24));
 
         if (daysRemaining > 0 && daysRemaining <= days) {
           const message = `[域名] ${domain.domain} 将在 ${daysRemaining} 天后过期。过期日期：${domain.expirationDate}`;
-          
+
           const lastSentDate = await env.DOMAINS_TG_KV.get(domain.domain); // 以域名为键获取上次发送时间
-          
+
           if (lastSentDate !== today) { // 检查是否已经在今天发送过
             await sendtgMessage(message, tgid, tgtoken); // 发送通知
             await env.DOMAINS_TG_KV.put(domain.domain, today); // 更新发送日期
@@ -60,6 +136,7 @@ export default {
         }
       }
 
+      // 生成最终HTML内容
       const htmlContent = await generateHTML(domains, sitename);
       return new Response(htmlContent, {
         headers: { 'Content-Type': 'text/html' },
@@ -71,6 +148,12 @@ export default {
   }
 };
 
+/**
+ * 生成HTML页面内容
+ * @param {Array} domains - 域名数据数组
+ * @param {string} SITENAME - 站点名称
+ * @returns {Promise<string>} HTML字符串
+ */
 async function generateHTML(domains, SITENAME) {
   const siteIcon = 'https://pan.811520.xyz/icon/domain.png';
   const bgimgURL = 'https://bing.img.run/1920x1080.php';
